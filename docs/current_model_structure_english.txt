@@ -1,0 +1,531 @@
+Current Custom YOLO Model Structure
+===================================
+
+Experiment name:
+voc8_current_efficientnetb0_deeper_img960
+
+Summary:
+This is our current best custom YOLO-style object detector. It uses a pretrained EfficientNet-B0 backbone, FPN + PAN neck, Gold-YOLO-lite gather-distribute fusion, four anchor-free detection heads, DFL box prediction, and auxiliary training heads.
+
+===================================
+1. Basic Model Information
+===================================
+
+- Model type: Custom YOLO-style object detector
+- Backbone: EfficientNet-B0 pretrained on ImageNet
+- Input image size: 960 x 960
+- Number of classes: 8
+- Classes: person, car, dog, cat, bus, train, bicycle, aeroplane
+- Total parameters: 11,683,044
+- Active inference parameters excluding auxiliary heads: 9,972,944
+- Detection scales: stride 4, stride 8, stride 16, stride 32
+- Experiment name: voc8_current_efficientnetb0_deeper_img960
+
+===================================
+2. High-Level Flow
+===================================
+
+Input image
+  -> EfficientNet-B0 pretrained backbone
+  -> Multi-scale features P2, P3, P4, P5
+  -> FPN top-down neck
+  -> PAN bottom-up neck
+  -> Gold-YOLO-lite gather-distribute fusion
+  -> Four detection heads
+  -> Box decoding and confidence scoring
+  -> NMS
+  -> Final detections
+
+===================================
+3. Input
+===================================
+
+The input tensor shape is:
+
+[B, 3, 960, 960]
+
+Where:
+- B = batch size
+- 3 = RGB channels
+- 960 x 960 = resized and letterboxed image size
+
+The model uses ImageNet-style normalization because the backbone is pretrained.
+
+===================================
+4. Backbone: EfficientNet-B0
+===================================
+
+The backbone extracts features at four different resolutions.
+
+For a 960 x 960 input:
+
+P2:
+- Stride: 4
+- Shape: [B, 24, 240, 240]
+- Purpose: high-resolution feature map, useful for small objects
+
+P3:
+- Stride: 8
+- Shape: [B, 40, 120, 120]
+- Purpose: medium-small objects
+
+P4:
+- Stride: 16
+- Shape: [B, 112, 60, 60]
+- Purpose: medium-large objects
+
+P5:
+- Stride: 32
+- Shape: [B, 1280, 30, 30]
+- Purpose: large objects and high-level semantic features
+
+Backbone parameter count:
+4,007,548
+
+===================================
+5. EfficientNet-B0 Stage Flow
+===================================
+
+Approximate EfficientNet-B0 feature flow:
+
+Input:
+[B, 3, 960, 960]
+
+Stem:
+[B, 32, 480, 480]
+
+Early MBConv blocks:
+[B, 16, 480, 480]
+
+P2 output:
+[B, 24, 240, 240]
+
+P3 output:
+[B, 40, 120, 120]
+
+P4 output:
+[B, 112, 60, 60]
+
+P5 output:
+[B, 1280, 30, 30]
+
+===================================
+6. P5 Reduction and SPPF
+===================================
+
+P5 from EfficientNet-B0 has many channels:
+
+P5:
+[B, 1280, 30, 30]
+
+The model reduces the channels:
+
+1280 -> 192
+
+Then it applies SPPF, which means Spatial Pyramid Pooling Fast.
+SPPF helps the model see a larger area without changing the feature map size.
+
+Output:
+[B, 192, 30, 30]
+
+===================================
+7. FPN Top-Down Neck
+===================================
+
+FPN sends strong high-level information from deep layers back to high-resolution layers.
+
+FPN4:
+- P5 upsample: [B, 192, 30, 30] -> [B, 192, 60, 60]
+- Concatenate with P4: [B, 112, 60, 60]
+- Concatenated shape: [B, 304, 60, 60]
+- C2fLite output: [B, 128, 60, 60]
+
+FPN3:
+- FPN4 reduce and upsample: [B, 128, 60, 60] -> [B, 96, 120, 120]
+- Concatenate with P3: [B, 40, 120, 120]
+- Concatenated shape: [B, 136, 120, 120]
+- C2fLite output: [B, 96, 120, 120]
+
+FPN2:
+- FPN3 reduce and upsample: [B, 96, 120, 120] -> [B, 64, 240, 240]
+- Concatenate with P2: [B, 24, 240, 240]
+- Concatenated shape: [B, 88, 240, 240]
+- C2fLite output: [B, 64, 240, 240]
+
+===================================
+8. PAN Bottom-Up Neck
+===================================
+
+PAN sends high-resolution detail back down to deeper layers.
+
+PAN3:
+- FPN2 downsample: [B, 64, 240, 240] -> [B, 96, 120, 120]
+- Concatenate with FPN3: [B, 96, 120, 120]
+- Concatenated shape: [B, 192, 120, 120]
+- C2fLite output: [B, 96, 120, 120]
+
+PAN4:
+- PAN3 downsample: [B, 96, 120, 120] -> [B, 128, 60, 60]
+- Concatenate with FPN4: [B, 128, 60, 60]
+- Concatenated shape: [B, 256, 60, 60]
+- C2fLite output: [B, 128, 60, 60]
+
+PAN5:
+- PAN4 downsample: [B, 128, 60, 60] -> [B, 192, 30, 30]
+- Concatenate with P5 context: [B, 192, 30, 30]
+- Concatenated shape: [B, 384, 30, 30]
+- C2fLite output: [B, 192, 30, 30]
+
+Base neck outputs:
+- N2: [B, 64, 240, 240]
+- N3: [B, 96, 120, 120]
+- N4: [B, 128, 60, 60]
+- N5: [B, 192, 30, 30]
+
+Neck parameter count:
+2,409,664
+
+===================================
+9. Gold-YOLO-Lite Fusion
+===================================
+
+Gold-YOLO-lite fusion lets all scales communicate with each other.
+
+Gather step:
+All feature maps are resized to the P3 size, 120 x 120.
+
+N2:
+[B, 64, 240, 240] -> [B, 96, 120, 120]
+
+N3:
+[B, 96, 120, 120] -> [B, 96, 120, 120]
+
+N4:
+[B, 128, 60, 60] -> [B, 96, 120, 120]
+
+N5:
+[B, 192, 30, 30] -> [B, 96, 120, 120]
+
+Then concatenate:
+[B, 96, 120, 120] x 4 -> [B, 384, 120, 120]
+
+Fusion:
+Conv 384 -> 96
+C2fLite fusion blocks
+
+Fused global feature:
+[B, 96, 120, 120]
+
+Distribute step:
+The fused feature is sent back to each scale.
+
+To N2:
+[B, 96, 120, 120] -> [B, 64, 240, 240]
+
+To N3:
+[B, 96, 120, 120] -> [B, 96, 120, 120]
+
+To N4:
+[B, 96, 120, 120] -> [B, 128, 60, 60]
+
+To N5:
+[B, 96, 120, 120] -> [B, 192, 30, 30]
+
+Gold fusion parameter count:
+1,137,216
+
+===================================
+10. Detection Feature Maps
+===================================
+
+After fusion, the final detection feature maps are:
+
+P2 detection head:
+- Stride: 4
+- Shape: [B, 64, 240, 240]
+- Prediction points: 57,600
+
+P3 detection head:
+- Stride: 8
+- Shape: [B, 96, 120, 120]
+- Prediction points: 14,400
+
+P4 detection head:
+- Stride: 16
+- Shape: [B, 128, 60, 60]
+- Prediction points: 3,600
+
+P5 detection head:
+- Stride: 32
+- Shape: [B, 192, 30, 30]
+- Prediction points: 900
+
+Total prediction points per image:
+57,600 + 14,400 + 3,600 + 900 = 76,500
+
+===================================
+11. Detection Heads
+===================================
+
+Each scale has one detection head.
+
+Each head predicts:
+- box_raw
+- objectness
+- class logits
+
+Settings:
+- num_classes = 8
+- reg_max = 16
+- DFL bins per box side = 17
+- Box sides = left, top, right, bottom
+- Box output channels = 4 x 17 = 68
+- Objectness channels = 1
+- Class channels = 8
+
+Output shapes:
+
+P2:
+- box: [B, 68, 240, 240]
+- obj:  [B, 1, 240, 240]
+- cls:  [B, 8, 240, 240]
+
+P3:
+- box: [B, 68, 120, 120]
+- obj:  [B, 1, 120, 120]
+- cls:  [B, 8, 120, 120]
+
+P4:
+- box: [B, 68, 60, 60]
+- obj:  [B, 1, 60, 60]
+- cls:  [B, 8, 60, 60]
+
+P5:
+- box: [B, 68, 30, 30]
+- obj:  [B, 1, 30, 30]
+- cls:  [B, 8, 30, 30]
+
+Main detection head parameter count:
+2,418,516
+
+===================================
+12. Head Depth
+===================================
+
+Small-object heads are deeper because small objects are harder.
+
+P2, stride 4:
+- Extra refine blocks: 4
+
+P3, stride 8:
+- Extra refine blocks: 3
+
+P4, stride 16:
+- Extra refine blocks: 2
+
+P5, stride 32:
+- Extra refine blocks: 2
+
+===================================
+13. Auxiliary Heads
+===================================
+
+Auxiliary heads are used only during training.
+They help the backbone and neck learn stronger features.
+They are ignored during inference.
+
+Aux P2:
+- Input: base N2 before Gold fusion
+- Extra refine blocks: 3
+
+Aux P3:
+- Input: base N3 before Gold fusion
+- Extra refine blocks: 2
+
+Aux P4:
+- Input: base N4 before Gold fusion
+- Extra refine blocks: 0
+
+Aux P5:
+- Input: base N5 before Gold fusion
+- Extra refine blocks: 0
+
+Auxiliary head parameter count:
+1,710,100
+
+===================================
+14. Anchor-Free Box Prediction
+===================================
+
+The model is anchor-free.
+It does not use preset anchor boxes.
+
+Each prediction point predicts four distances:
+- left
+- top
+- right
+- bottom
+
+The point is treated as the box center reference.
+The model predicts how far the box extends from that point.
+
+Box decoding:
+x1 = center_x - left_distance
+y1 = center_y - top_distance
+x2 = center_x + right_distance
+y2 = center_y + bottom_distance
+
+===================================
+15. DFL Box Prediction
+===================================
+
+DFL means Distribution Focal Loss.
+Instead of predicting one direct distance number, the model predicts a distribution over 17 bins.
+
+Because:
+reg_max = 16
+bins = 0, 1, 2, ..., 16
+
+For each side of the box, DFL turns the distribution into a smoother continuous distance.
+
+This improves box localization quality.
+
+===================================
+16. Scoring
+===================================
+
+For each prediction:
+
+objectness = sigmoid(obj_logit)
+class_score = sigmoid(cls_logit)
+final_score = objectness x class_score
+
+The final score is used as the confidence score.
+
+===================================
+17. NMS
+===================================
+
+After decoding boxes, the model applies NMS.
+
+Current evaluation settings:
+- Class-wise NMS IoU threshold: 0.5
+- Max detections per image: 100
+- Cross-class duplicate suppression: True
+- Duplicate IoU threshold: 0.9
+- Size similarity threshold: 0.95
+- Center distance threshold: 0.05
+
+This removes repeated boxes and keeps the best boxes.
+
+===================================
+18. Parameter Breakdown
+===================================
+
+EfficientNet-B0 backbone: 4,007,548
+Neck: 2,409,664
+Gold-YOLO-lite fusion: 1,137,216
+Main detection heads: 2,418,516
+Auxiliary heads: 1,710,100
+
+Total training parameters:
+11,683,044
+
+Active inference parameters:
+4,007,548 + 2,409,664 + 1,137,216 + 2,418,516 = 9,972,944
+
+===================================
+19. Training Loss
+===================================
+
+The model trains with these main loss parts:
+
+Classification loss:
+- Helps predict the correct class.
+
+Objectness loss:
+- Helps predict whether an object exists at a point.
+
+Box loss:
+- Helps make the predicted box coordinates accurate.
+
+DFL loss:
+- Helps make the predicted box distance distribution accurate.
+
+Auxiliary loss:
+- Helps earlier features learn better during training.
+
+The model uses quality-aware objectness.
+This means better matched boxes receive stronger objectness targets.
+
+===================================
+20. Current Results
+===================================
+
+Validation split:
+val = VOC2007 test
+
+Test split:
+test = VOC2012 val
+
+Results on val:
+
+conf = 0.01
+- Precision: 0.2929
+- Recall: 0.9271
+- mAP50: 0.8366
+- mAP50-95: 0.6271
+
+conf = 0.10
+- Precision: 0.7985
+- Recall: 0.8322
+- mAP50: 0.7941
+- mAP50-95: 0.6051
+
+Results on test:
+
+conf = 0.01
+- Precision: 0.3138
+- Recall: 0.8666
+- mAP50: 0.7735
+- mAP50-95: 0.5872
+
+conf = 0.10
+- Precision: 0.8359
+- Recall: 0.7395
+- mAP50: 0.7179
+- mAP50-95: 0.5580
+
+===================================
+21. Strengths and Weaknesses
+===================================
+
+Strengths:
+- Strong box quality
+- High mAP50-95 compared with YOLOv8n
+- Good large-object detection
+- Good recall at low confidence
+- Practical precision is good at conf = 0.10
+
+Weaknesses:
+- Small objects are still weak
+- Medium objects are also weaker than large objects
+- The model is larger than YOLOv8n
+- It needs more inference cost than YOLOv8n
+
+===================================
+22. Short Final Summary
+===================================
+
+The current model is:
+
+EfficientNet-B0 pretrained backbone
++ FPN
++ PAN
++ Gold-YOLO-lite fusion
++ four-scale anchor-free detection heads
++ DFL box prediction
++ auxiliary training heads
+
+It is stronger than YOLOv8n in strict localization quality, especially mAP50-95.
+Its main weakness is still small and medium object detection.

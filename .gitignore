@@ -1,0 +1,46 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+env/
+
+# Conda / local
+*.log
+.DS_Store
+Thumbs.db
+
+# Large datasets
+data/raw/
+data/external/
+data/processed/
+*.jpg
+*.jpeg
+*.png
+*.xml
+
+# Training outputs
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Temporary outputs
+outputs/
+predictions/
+debug/
+tmp/
+
+# IDE
+.vscode/
+.idea/
+
+# External baseline folders and local logs
+external_models/
+log.txt
