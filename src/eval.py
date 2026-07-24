@@ -1,24 +1,54 @@
 from pathlib import Path
+import argparse
+from contextlib import nullcontext
 from collections import defaultdict
 import random
 import copy
 
 import torch
 from torch.utils.data import DataLoader, Subset
+from torchvision.ops import batched_nms
 
 from dataset import VOCDatasetYOLO, detection_collate_fn, VOC_CLASSES
-from model import TinyYOLOAnchorFree, count_parameters
+from model import (
+    TinyYOLOAnchorFree,
+    count_parameters,
+    load_inference_state_dict,
+)
 from predict import nms
 
 
-EXPECTED_EXPERIMENT_NAME = "voc8_current_efficientnetb0_deeper_img960"
+EXPECTED_EXPERIMENT_NAME = "voc8_v08_768_mobilenetv3_distilled"
+
+
+def inference_autocast(device: torch.device, precision: str):
+    if precision == "fp16" and device.type == "cuda":
+        return torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+        )
+
+    return nullcontext()
+
+
+def move_images_to_device(
+    images: torch.Tensor,
+    device: torch.device,
+    memory_format: str,
+) -> torch.Tensor:
+    images = images.to(device, non_blocking=True)
+
+    if memory_format == "channels-last":
+        images = images.contiguous(memory_format=torch.channels_last)
+
+    return images
 
 
 def validate_checkpoint_metadata(
     checkpoint: dict,
     checkpoint_path: Path,
     expected_experiment_name: str,
-    expected_parameter_count: int,
+    expected_inference_parameter_count: int,
 ) -> None:
     checkpoint_experiment = checkpoint.get("experiment_name")
 
@@ -31,17 +61,17 @@ def validate_checkpoint_metadata(
             "Run python src\\train.py to create a current checkpoint."
         )
 
-    checkpoint_parameter_count = checkpoint.get("model_parameter_count")
+    checkpoint_parameter_count = checkpoint.get("inference_parameter_count")
 
     if checkpoint_parameter_count is not None:
         checkpoint_parameter_count = int(checkpoint_parameter_count)
 
-        if checkpoint_parameter_count != expected_parameter_count:
+        if checkpoint_parameter_count != expected_inference_parameter_count:
             raise ValueError(
                 "Checkpoint parameter count does not match the current model.\n"
                 f"Checkpoint: {checkpoint_path}\n"
-                f"Expected params: {expected_parameter_count}\n"
-                f"Found params:    {checkpoint_parameter_count}\n"
+                f"Expected inference params: {expected_inference_parameter_count}\n"
+                f"Found inference params:    {checkpoint_parameter_count}\n"
                 "Run python src\\train.py to create a current checkpoint."
             )
 
@@ -259,58 +289,87 @@ def collect_predictions_per_image(
     duplicate_iou_threshold: float = 0.90,
     size_similarity_threshold: float = 0.95,
     center_distance_threshold: float = 0.05,
+    nms_backend: str = "python",
 ):
-    all_boxes = []
-    all_scores = []
-    all_classes = []
+    if nms_backend not in {"python", "torchvision"}:
+        raise ValueError(
+            f"Unsupported NMS backend: {nms_backend!r}. "
+            "Use 'python' or 'torchvision'."
+        )
 
-    num_classes = scores.shape[1]
+    if nms_backend == "torchvision":
+        candidate_mask = scores >= conf_threshold
+        point_indices, class_ids = candidate_mask.nonzero(as_tuple=True)
 
-    # Step 1:
-    # Normal class-wise NMS.
-    for class_id in range(num_classes):
-        class_scores = scores[:, class_id]
-        keep = class_scores >= conf_threshold
+        if point_indices.numel() == 0:
+            return (
+                torch.zeros((0, 4), dtype=torch.float32, device=boxes.device),
+                torch.zeros((0,), dtype=torch.float32, device=boxes.device),
+                torch.zeros((0,), dtype=torch.long, device=boxes.device),
+            )
 
-        if keep.sum() == 0:
-            continue
+        final_boxes = boxes[point_indices].float()
+        final_scores = scores[point_indices, class_ids].float()
+        final_classes = class_ids.long()
 
-        class_boxes = boxes[keep]
-        class_scores = class_scores[keep]
-
-        keep_indices = nms(
-            boxes=class_boxes,
-            scores=class_scores,
+        keep_indices = batched_nms(
+            boxes=final_boxes,
+            scores=final_scores,
+            idxs=final_classes,
             iou_threshold=nms_iou_threshold,
         )
 
-        class_boxes = class_boxes[keep_indices]
-        class_scores = class_scores[keep_indices]
+        final_boxes = final_boxes[keep_indices]
+        final_scores = final_scores[keep_indices]
+        final_classes = final_classes[keep_indices]
+    else:
+        all_boxes = []
+        all_scores = []
+        all_classes = []
 
-        class_ids = torch.full(
-            (class_boxes.shape[0],),
-            class_id,
-            dtype=torch.long,
-            device=boxes.device,
-        )
+        num_classes = scores.shape[1]
 
-        all_boxes.append(class_boxes)
-        all_scores.append(class_scores)
-        all_classes.append(class_ids)
+        for class_id in range(num_classes):
+            class_scores = scores[:, class_id]
+            keep = class_scores >= conf_threshold
 
-    if not all_boxes:
-        return (
-            torch.zeros((0, 4), device=boxes.device),
-            torch.zeros((0,), device=boxes.device),
-            torch.zeros((0,), dtype=torch.long, device=boxes.device),
-        )
+            if keep.sum() == 0:
+                continue
 
-    final_boxes = torch.cat(all_boxes, dim=0)
-    final_scores = torch.cat(all_scores, dim=0)
-    final_classes = torch.cat(all_classes, dim=0)
+            class_boxes = boxes[keep].float()
+            class_scores = class_scores[keep].float()
 
-    # Step 2:
-    # Remove only very obvious cross-class duplicates.
+            keep_indices = nms(
+                boxes=class_boxes,
+                scores=class_scores,
+                iou_threshold=nms_iou_threshold,
+            )
+
+            class_boxes = class_boxes[keep_indices]
+            class_scores = class_scores[keep_indices]
+
+            class_ids = torch.full(
+                (class_boxes.shape[0],),
+                class_id,
+                dtype=torch.long,
+                device=boxes.device,
+            )
+
+            all_boxes.append(class_boxes)
+            all_scores.append(class_scores)
+            all_classes.append(class_ids)
+
+        if not all_boxes:
+            return (
+                torch.zeros((0, 4), dtype=torch.float32, device=boxes.device),
+                torch.zeros((0,), dtype=torch.float32, device=boxes.device),
+                torch.zeros((0,), dtype=torch.long, device=boxes.device),
+            )
+
+        final_boxes = torch.cat(all_boxes, dim=0)
+        final_scores = torch.cat(all_scores, dim=0)
+        final_classes = torch.cat(all_classes, dim=0)
+
     if use_cross_class_duplicate_suppression:
         final_boxes, final_scores, final_classes = suppress_cross_class_duplicate_boxes(
             boxes=final_boxes,
@@ -575,37 +634,87 @@ def filter_predictions_by_predicted_size(
 
 @torch.no_grad()
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset-root", type=str, default="data/processed/voc2007_2012_custom_voc8")
+    parser.add_argument("--checkpoint", type=str, default="runs/checkpoints_voc8_v08_768_mobilenetv3_distilled/best.pt")
+    parser.add_argument("--split", choices=["val", "test"], default="val")
+    parser.add_argument("--image-size", type=int, default=768)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--max-images", type=int, default=0)
+    parser.add_argument("--conf", type=float, default=0.10)
+    parser.add_argument("--nms-iou", type=float, default=0.50)
+    parser.add_argument("--max-det", type=int, default=100)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument(
+        "--precision",
+        choices=["fp32", "fp16"],
+        default="fp32",
+        help="Use fp32 for published metrics. Use fp16 to test optimized inference accuracy.",
+    )
+    parser.add_argument(
+        "--memory-format",
+        choices=["contiguous", "channels-last"],
+        default="contiguous",
+    )
+    parser.add_argument(
+        "--nms-backend",
+        choices=["python", "torchvision"],
+        default="python",
+        help="python preserves the original evaluation path; torchvision is faster.",
+    )
+    parser.add_argument("--compile", dest="compile_model", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--disable-cross-class-duplicate-suppression",
+        action="store_true",
+    )
+    args = parser.parse_args()
+
     project_root = Path(__file__).resolve().parents[1]
 
-    dataset_root = project_root / "data" / "processed" / "voc2007_2012_custom_voc8"
-    checkpoint_path = project_root / "runs" / "checkpoints_voc8_current" / "best.pt"
+    dataset_root = Path(args.dataset_root)
+    checkpoint_path = Path(args.checkpoint)
+    if not dataset_root.is_absolute():
+        dataset_root = project_root / dataset_root
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = project_root / checkpoint_path
 
     # "val"  = VOC2007 test, used as validation during training
     # "test" = VOC2012 val, used as final test split
-    split = "test"
+    split = args.split
 
-    image_size = 960
+    image_size = args.image_size
     num_classes = len(VOC_CLASSES)
-    batch_size = 4
+    batch_size = args.batch_size
 
-    max_eval_images = None
+    max_eval_images = args.max_images if args.max_images > 0 else None
     use_random_subset = True
-    random_seed = 42
+    random_seed = args.random_seed
 
-    # Use 0.01 for AP-style ranking.
-    # Use 0.16 or 0.20 for practical fixed-threshold precision/recall.
-    conf_threshold = 0.1
+    conf_threshold = args.conf
 
-    nms_iou_threshold = 0.50
-    max_detections_per_image = 100
+    nms_iou_threshold = args.nms_iou
+    max_detections_per_image = args.max_det
     iou_match_threshold = 0.50
 
-    use_cross_class_duplicate_suppression = True
+    use_cross_class_duplicate_suppression = (
+        not args.disable_cross_class_duplicate_suppression
+    )
     duplicate_iou_threshold = 0.90
     size_similarity_threshold = 0.95
     center_distance_threshold = 0.05
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.precision == "fp16" and device.type != "cuda":
+        raise RuntimeError("FP16 evaluation requires a CUDA device.")
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     print(f"Device: {device}")
     print(f"Dataset root: {dataset_root}")
@@ -623,6 +732,12 @@ def main():
     print(f"Duplicate IoU threshold: {duplicate_iou_threshold}")
     print(f"Size similarity threshold: {size_similarity_threshold}")
     print(f"Center distance threshold: {center_distance_threshold}")
+    print(f"Precision: {args.precision}")
+    print(f"Memory format: {args.memory_format}")
+    print(f"NMS backend: {args.nms_backend}")
+    print(f"torch.compile: {args.compile_model}")
+    if args.compile_model:
+        print(f"Compile mode: {args.compile_mode}")
     print()
 
     full_dataset = VOCDatasetYOLO(
@@ -672,7 +787,7 @@ def main():
         image_size=image_size,
         reg_max=16,
         pretrained_backbone=False,
-        use_auxiliary_heads=True,
+        use_auxiliary_heads=False,
     ).to(device)
 
     model_parameter_count = count_parameters(model)
@@ -683,15 +798,28 @@ def main():
             "Train first or check the checkpoint path."
         )
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     validate_checkpoint_metadata(
         checkpoint=checkpoint,
         checkpoint_path=checkpoint_path,
         expected_experiment_name=EXPECTED_EXPERIMENT_NAME,
-        expected_parameter_count=model_parameter_count,
+        expected_inference_parameter_count=model_parameter_count,
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_inference_state_dict(model, checkpoint["model_state_dict"])
     model.eval()
+
+    if args.memory_format == "channels-last":
+        model = model.to(memory_format=torch.channels_last)
+
+    if args.compile_model:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("This PyTorch installation does not support torch.compile.")
+
+        model = torch.compile(
+            model,
+            mode=args.compile_mode,
+            fullgraph=False,
+        )
 
     print(f"Loaded epoch: {checkpoint['epoch']}")
     print(f"Checkpoint val loss: {checkpoint['val_loss']:.4f}")
@@ -708,12 +836,17 @@ def main():
     image_counter = 0
 
     for batch_idx, (images, targets, image_paths) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True)
+        images = move_images_to_device(
+            images=images,
+            device=device,
+            memory_format=args.memory_format,
+        )
 
-        decoded = model(images, decode=True)
+        with inference_autocast(device=device, precision=args.precision):
+            decoded = model(images, decode=True)
 
-        batch_boxes = decoded["boxes"]
-        batch_scores = decoded["scores"]
+        batch_boxes = decoded["boxes"].float()
+        batch_scores = decoded["scores"].float()
 
         batch_size_actual = images.shape[0]
 
@@ -754,6 +887,7 @@ def main():
                 duplicate_iou_threshold=duplicate_iou_threshold,
                 size_similarity_threshold=size_similarity_threshold,
                 center_distance_threshold=center_distance_threshold,
+                nms_backend=args.nms_backend,
             )
 
             final_boxes = final_boxes.detach().cpu()

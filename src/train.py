@@ -9,17 +9,27 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 
 from dataset import VOCDatasetYOLO, detection_collate_fn, VOC_CLASSES
-from model import TinyYOLOAnchorFree, count_parameters
+from model import TinyYOLOAnchorFree, count_parameters, count_inference_parameters
+from teacher_model import (
+    YOLOv06Teacher,
+    V06_EXPERIMENT_NAME,
+    load_v06_teacher_checkpoint,
+)
+from distillation import DetectionDistillationLoss
 from loss import YOLOAnchorFreeLoss
 
 
-EXPERIMENT_NAME = "voc8_current_efficientnetb0_deeper_img960"
+EXPERIMENT_NAME = "voc8_v08_768_mobilenetv3_distilled"
 EXPERIMENT_DESCRIPTION = (
-    "Current VOC8 model: quality-aware 11.68M EfficientNet-B0 deeper P2/P3/P4/P5 neck and heads, "
-    "trained at image_size=960 with batch_size=4 using pretrained EfficientNet-B0. No attention, no weighted fusion, no WIoU."
+    "v0.8 VOC8 compact distilled detector: pretrained MobileNetV3-Large "
+    "backbone, 56/72/112 FPN-PAN neck, Gold-YOLO-lite fusion width 48, "
+    "48-channel minimum detection-head width, 768x768 input, no P2 head, "
+    "reg_max=16, and detection-specific knowledge distillation from the "
+    "frozen v0.6 EfficientNet-B0 teacher."
 )
+
+
 POSITIVE_DIAGNOSTIC_KEYS = [
-    "positive_stride_4",
     "positive_stride_8",
     "positive_stride_16",
     "positive_stride_32",
@@ -41,11 +51,11 @@ def loss_value(loss_dict: dict, key: str) -> float:
     return float(value)
 
 
+
 def add_positive_diagnostics_from_loss(
     running: dict,
     loss_dict: dict,
 ) -> None:
-    running["positive_stride_4"] += loss_value(loss_dict, "num_positive_stride_4")
     running["positive_stride_8"] += loss_value(loss_dict, "num_positive_stride_8")
     running["positive_stride_16"] += loss_value(loss_dict, "num_positive_stride_16")
     running["positive_stride_32"] += loss_value(loss_dict, "num_positive_stride_32")
@@ -125,6 +135,7 @@ def save_checkpoint(
     checkpoint_path: Path,
     model,
     ema,
+    distiller,
     optimizer,
     scaler,
     epoch: int,
@@ -142,10 +153,14 @@ def save_checkpoint(
             "experiment_name": experiment_name,
             "experiment_description": experiment_description,
             "model_parameter_count": model_parameter_count,
+            "inference_parameter_count": count_inference_parameters(model),
             "epoch": epoch,
             "model_state_dict": ema.ema.state_dict(),
             "raw_model_state_dict": model.state_dict(),
+            "distiller_state_dict": distiller.state_dict(),
+            "distiller_parameter_count": count_parameters(distiller),
             "optimizer_state_dict": optimizer.state_dict(),
+            "teacher_experiment_name": V06_EXPERIMENT_NAME,
             "scaler_state_dict": scaler.state_dict(),
             "ema_updates": ema.updates,
             "train_loss": train_loss,
@@ -200,6 +215,15 @@ def inspect_checkpoint_for_resume(
                 checkpoint,
             )
 
+    teacher_experiment = checkpoint.get("teacher_experiment_name")
+    if teacher_experiment is not None and teacher_experiment != V06_EXPERIMENT_NAME:
+        return (
+            False,
+            "checkpoint teacher metadata does not match v0.6 "
+            f"({teacher_experiment!r})",
+            checkpoint,
+        )
+
     return True, "checkpoint matches current experiment", checkpoint
 
 
@@ -223,6 +247,7 @@ def load_training_checkpoint(
     checkpoint_path: Path,
     model,
     ema,
+    distiller,
     optimizer,
     scaler,
     device,
@@ -269,6 +294,11 @@ def load_training_checkpoint(
         ema.ema.load_state_dict(ema_model_state)
     else:
         ema.ema.load_state_dict(model.state_dict())
+
+    distiller_state = checkpoint.get("distiller_state_dict")
+    if distiller_state is None:
+        raise KeyError("Checkpoint does not contain distiller_state_dict.")
+    distiller.load_state_dict(distiller_state)
 
     optimizer_state = checkpoint.get("optimizer_state_dict")
     if optimizer_state is not None:
@@ -317,12 +347,17 @@ def append_history(
                     "train_total_loss",
                     "train_main_loss",
                     "train_aux_loss",
+                    "train_distillation_scale",
+                    "train_distillation_loss",
+                    "train_distill_feature_loss",
+                    "train_distill_classification_loss",
+                    "train_distill_objectness_loss",
+                    "train_distill_dfl_loss",
                     "train_cls_loss",
                     "train_obj_loss",
                     "train_box_loss",
                     "train_dfl_loss",
                     "train_positive_points",
-                    "train_positive_stride_4",
                     "train_positive_stride_8",
                     "train_positive_stride_16",
                     "train_positive_stride_32",
@@ -335,7 +370,6 @@ def append_history(
                     "val_box_loss",
                     "val_dfl_loss",
                     "val_positive_points",
-                    "val_positive_stride_4",
                     "val_positive_stride_8",
                     "val_positive_stride_16",
                     "val_positive_stride_32",
@@ -353,12 +387,17 @@ def append_history(
                 train_metrics["loss"],
                 train_metrics["main_loss"],
                 train_metrics["aux_loss"],
+                train_metrics["distillation_scale"],
+                train_metrics["distillation_loss"],
+                train_metrics["distill_feature_loss"],
+                train_metrics["distill_classification_loss"],
+                train_metrics["distill_objectness_loss"],
+                train_metrics["distill_dfl_loss"],
                 train_metrics["cls_loss"],
                 train_metrics["obj_loss"],
                 train_metrics["box_loss"],
                 train_metrics["dfl_loss"],
                 train_metrics["positive_points"],
-                train_metrics["positive_stride_4"],
                 train_metrics["positive_stride_8"],
                 train_metrics["positive_stride_16"],
                 train_metrics["positive_stride_32"],
@@ -371,7 +410,6 @@ def append_history(
                 val_metrics["box_loss"],
                 val_metrics["dfl_loss"],
                 val_metrics["positive_points"],
-                val_metrics["positive_stride_4"],
                 val_metrics["positive_stride_8"],
                 val_metrics["positive_stride_16"],
                 val_metrics["positive_stride_32"],
@@ -382,8 +420,22 @@ def append_history(
         )
 
 
+def distillation_schedule(epoch: int, num_epochs: int) -> float:
+    """Warm up without distillation, use full KD, then taper for GT fitting."""
+
+    if epoch <= 2:
+        return 0.0
+
+    if epoch >= max(3, num_epochs - 2):
+        return 0.5
+
+    return 1.0
+
+
 def train_one_epoch(
     model,
+    teacher,
+    distiller,
     ema,
     criterion,
     loader,
@@ -399,10 +451,19 @@ def train_one_epoch(
     log_interval: int = 25,
 ):
     model.train()
+    teacher.eval()
+    distiller.train()
+
+    kd_scale = distillation_schedule(epoch=epoch, num_epochs=num_epochs)
 
     running_total_loss = 0.0
     running_main_loss = 0.0
     running_aux_loss = 0.0
+    running_distillation_loss = 0.0
+    running_distill_feature_loss = 0.0
+    running_distill_classification_loss = 0.0
+    running_distill_objectness_loss = 0.0
+    running_distill_dfl_loss = 0.0
     running_cls_loss = 0.0
     running_obj_loss = 0.0
     running_box_loss = 0.0
@@ -434,24 +495,51 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            outputs = model(
+            student_result = model(
                 images,
                 decode=False,
                 return_aux=True,
+                return_features=(kd_scale > 0.0),
             )
 
-            main_loss_dict = criterion(outputs["main"], targets)
-            aux_loss_dict = criterion(outputs["aux"], targets)
+            main_loss_dict = criterion(student_result["main"], targets)
+            aux_loss_dict = criterion(student_result["aux"], targets)
 
             main_loss = main_loss_dict["loss"]
             aux_loss = aux_loss_dict["loss"]
 
-            loss = main_loss + aux_loss_weight * aux_loss
+            if kd_scale > 0.0:
+                with torch.no_grad():
+                    teacher_result = teacher(images, return_features=True)
+
+                distillation_dict = distiller(
+                    student_result=student_result,
+                    teacher_result=teacher_result,
+                    targets=targets,
+                )
+                distillation_loss = distillation_dict["loss"]
+            else:
+                zero = main_loss * 0.0
+                distillation_dict = {
+                    "loss": zero,
+                    "feature_loss": zero,
+                    "classification_loss": zero,
+                    "objectness_loss": zero,
+                    "dfl_loss": zero,
+                }
+                distillation_loss = zero
+
+            loss = (
+                main_loss
+                + aux_loss_weight * aux_loss
+                + kd_scale * distillation_loss
+            )
 
         scaler.scale(loss).backward()
 
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+        trainable_parameters = list(model.parameters()) + list(distiller.parameters())
+        torch.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=10.0)
 
         scaler.step(optimizer)
         scaler.update()
@@ -461,6 +549,11 @@ def train_one_epoch(
         total_loss_value = loss.item()
         main_loss_value = main_loss.item()
         aux_loss_value = aux_loss.item()
+        distillation_loss_value = distillation_loss.item()
+        distill_feature_value = distillation_dict["feature_loss"].item()
+        distill_classification_value = distillation_dict["classification_loss"].item()
+        distill_objectness_value = distillation_dict["objectness_loss"].item()
+        distill_dfl_value = distillation_dict["dfl_loss"].item()
         cls_loss_value = main_loss_dict["cls_loss"].item()
         obj_loss_value = main_loss_dict["obj_loss"].item()
         box_loss_value = main_loss_dict["box_loss"].item()
@@ -475,6 +568,11 @@ def train_one_epoch(
         running_total_loss += total_loss_value
         running_main_loss += main_loss_value
         running_aux_loss += aux_loss_value
+        running_distillation_loss += distillation_loss_value
+        running_distill_feature_loss += distill_feature_value
+        running_distill_classification_loss += distill_classification_value
+        running_distill_objectness_loss += distill_objectness_value
+        running_distill_dfl_loss += distill_dfl_value
         running_cls_loss += cls_loss_value
         running_obj_loss += obj_loss_value
         running_box_loss += box_loss_value
@@ -487,6 +585,7 @@ def train_one_epoch(
             avg_total_loss = running_total_loss / batch_idx
             avg_main_loss = running_main_loss / batch_idx
             avg_aux_loss = running_aux_loss / batch_idx
+            avg_kd_loss = running_distillation_loss / batch_idx
             avg_cls_loss = running_cls_loss / batch_idx
             avg_obj_loss = running_obj_loss / batch_idx
             avg_box_loss = running_box_loss / batch_idx
@@ -504,13 +603,13 @@ def train_one_epoch(
                 f"loss {avg_total_loss:.4f} | "
                 f"main {avg_main_loss:.4f} | "
                 f"aux {avg_aux_loss:.4f} | "
+                f"kd {avg_kd_loss:.4f} x {kd_scale:.2f} | "
                 f"cls {avg_cls_loss:.4f} | "
                 f"obj {avg_obj_loss:.4f} | "
                 f"box {avg_box_loss:.4f} | "
                 f"dfl {avg_dfl_loss:.4f} | "
                 f"pos {avg_pos:.1f} | "
-                f"s4/s8/s16/s32 "
-                f"{avg_diag['positive_stride_4']:.1f}/"
+                f"s8/s16/s32 "
                 f"{avg_diag['positive_stride_8']:.1f}/"
                 f"{avg_diag['positive_stride_16']:.1f}/"
                 f"{avg_diag['positive_stride_32']:.1f} | "
@@ -530,12 +629,19 @@ def train_one_epoch(
         "loss": running_total_loss / len(loader),
         "main_loss": running_main_loss / len(loader),
         "aux_loss": running_aux_loss / len(loader),
+        "distillation_scale": kd_scale,
+        "distillation_loss": running_distillation_loss / len(loader),
+        "distill_feature_loss": running_distill_feature_loss / len(loader),
+        "distill_classification_loss": (
+            running_distill_classification_loss / len(loader)
+        ),
+        "distill_objectness_loss": running_distill_objectness_loss / len(loader),
+        "distill_dfl_loss": running_distill_dfl_loss / len(loader),
         "cls_loss": running_cls_loss / len(loader),
         "obj_loss": running_obj_loss / len(loader),
         "box_loss": running_box_loss / len(loader),
         "dfl_loss": running_dfl_loss / len(loader),
         "positive_points": running_positive_points / len(loader),
-        "positive_stride_4": avg_positive_diagnostics["positive_stride_4"],
         "positive_stride_8": avg_positive_diagnostics["positive_stride_8"],
         "positive_stride_16": avg_positive_diagnostics["positive_stride_16"],
         "positive_stride_32": avg_positive_diagnostics["positive_stride_32"],
@@ -612,8 +718,7 @@ def validate_one_epoch(
         f"box {avg_box_loss:.4f} | "
         f"dfl {avg_dfl_loss:.4f} | "
         f"pos {avg_pos:.1f} | "
-        f"s4/s8/s16/s32 "
-        f"{avg_diag['positive_stride_4']:.1f}/"
+        f"s8/s16/s32 "
         f"{avg_diag['positive_stride_8']:.1f}/"
         f"{avg_diag['positive_stride_16']:.1f}/"
         f"{avg_diag['positive_stride_32']:.1f} | "
@@ -631,7 +736,6 @@ def validate_one_epoch(
         "box_loss": avg_box_loss,
         "dfl_loss": avg_dfl_loss,
         "positive_points": avg_pos,
-        "positive_stride_4": avg_diag["positive_stride_4"],
         "positive_stride_8": avg_diag["positive_stride_8"],
         "positive_stride_16": avg_diag["positive_stride_16"],
         "positive_stride_32": avg_diag["positive_stride_32"],
@@ -644,10 +748,17 @@ def validate_one_epoch(
 def main():
     project_root = Path(__file__).resolve().parents[1]
     dataset_root = project_root / "data" / "processed" / "voc2007_2012_custom_voc8"
-    checkpoint_dir = project_root / "runs" / "checkpoints_voc8_current"
-    history_path = project_root / "runs" / "training_history_voc8_current.csv"
+    checkpoint_dir = project_root / "runs" / "checkpoints_voc8_v08_768_mobilenetv3_distilled"
+    history_path = project_root / "runs" / "training_history_voc8_v08_768_mobilenetv3_distilled.csv"
+    teacher_checkpoint_path = (
+        project_root
+        / "runs"
+        / "checkpoints_voc8_v06_768_no_p2_regmax16_depth_slim"
+        / "best.pt"
+    )
 
-    image_size = 960
+    image_size = 768
+    reg_max = 16
     num_classes = len(VOC_CLASSES)
 
     batch_size = 4
@@ -714,19 +825,56 @@ def main():
     model = TinyYOLOAnchorFree(
         num_classes=num_classes,
         image_size=image_size,
-        reg_max=16,
+        reg_max=reg_max,
         pretrained_backbone=True,
         use_auxiliary_heads=True,
     ).to(device)
 
     model_parameter_count = count_parameters(model)
+    inference_parameter_count = count_inference_parameters(model)
+
+    distiller = DetectionDistillationLoss(
+        student_channels=(56, 72, 112),
+        teacher_channels=(64, 80, 128),
+        num_classes=num_classes,
+        reg_max=reg_max,
+        temperature=2.0,
+        teacher_conf_threshold=0.05,
+        feature_weight=0.20,
+        classification_weight=0.40,
+        objectness_weight=0.20,
+        dfl_weight=0.30,
+    ).to(device)
+    distiller_parameter_count = count_parameters(distiller)
+
+    if not teacher_checkpoint_path.exists():
+        raise FileNotFoundError(
+            "v0.6 teacher checkpoint not found. Distilled v0.8 training requires:\n"
+            f"{teacher_checkpoint_path}"
+        )
+
+    teacher = YOLOv06Teacher(
+        num_classes=num_classes,
+        image_size=image_size,
+        reg_max=reg_max,
+    )
+
+    teacher_checkpoint = torch.load(
+        teacher_checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    load_v06_teacher_checkpoint(teacher, teacher_checkpoint)
+    teacher_parameter_count = sum(p.numel() for p in teacher.parameters())
+    del teacher_checkpoint
+    teacher = teacher.to(device)
 
     ema = ModelEMA(model, decay=0.9998)
 
     criterion = YOLOAnchorFreeLoss(
         num_classes=num_classes,
         image_size=image_size,
-        reg_max=16,
+        reg_max=reg_max,
         box_loss_weight=5.0,
         cls_loss_weight=1.0,
         obj_loss_weight=1.25,
@@ -741,8 +889,62 @@ def main():
         min_quality_target=0.05,
     ).to(device)
 
+    # v0.8 architecture guard.
+    assert model.image_size == image_size
+    assert model.reg_max == reg_max
+    assert model.num_bins == reg_max + 1
+    assert model.strides == [8, 16, 32]
+
+    expected_box_channels = 4 * (reg_max + 1)
+    expected_head_channels = {
+        "head_p3": 56,
+        "head_p4": 72,
+        "head_p5": 112,
+        "aux_head_p3": 56,
+        "aux_head_p4": 72,
+        "aux_head_p5": 112,
+    }
+
+    for head_name, expected_input_channels in expected_head_channels.items():
+        head = getattr(model, head_name)
+        assert head is not None
+
+        first_box_conv = head.box_branch[0].block[0]
+        final_box_conv = head.box_branch[-1]
+
+        assert first_box_conv.in_channels == expected_input_channels, (
+            f"{head_name} has {first_box_conv.in_channels} input channels; "
+            f"expected {expected_input_channels}."
+        )
+        assert first_box_conv.out_channels == max(48, expected_input_channels)
+        assert final_box_conv.out_channels == expected_box_channels
+
+    assert model.neck.p5_reduce.block[0].in_channels == 960
+    assert model.neck.p5_reduce.block[0].out_channels == 112
+    assert model.gold_fusion.n3_to_fusion.block[0].out_channels == 48
+    assert len(model.neck.fpn3.blocks) == 3
+    assert len(model.neck.fpn4.blocks) == 2
+    assert len(model.neck.pan4.blocks) == 2
+    assert len(model.neck.pan5.blocks) == 2
+    assert len(model.gold_fusion.fuse[1].blocks) == 2
+    assert not isinstance(model.gold_fusion.refine_n3, torch.nn.Identity)
+    assert isinstance(model.gold_fusion.refine_n4, torch.nn.Identity)
+    assert isinstance(model.gold_fusion.refine_n5, torch.nn.Identity)
+    assert len(model.head_p3.extra_refine.blocks) == 3
+    assert len(model.head_p4.extra_refine.blocks) == 2
+    assert len(model.head_p5.extra_refine.blocks) == 2
+
+    assert distiller.feature_adapters["n3"].in_channels == 56
+    assert distiller.feature_adapters["n3"].out_channels == 64
+    assert distiller.feature_adapters["n4"].in_channels == 72
+    assert distiller.feature_adapters["n4"].out_channels == 80
+    assert distiller.feature_adapters["n5"].in_channels == 112
+    assert distiller.feature_adapters["n5"].out_channels == 128
+
+    print("v0.8 architecture and distillation checks passed")
+
     optimizer = AdamW(
-        model.parameters(),
+        list(model.parameters()) + list(distiller.parameters()),
         lr=learning_rate,
         weight_decay=weight_decay,
     )
@@ -752,14 +954,21 @@ def main():
     print(f"Train split:        {train_split}")
     print(f"Val split:          {val_split}")
     print(f"Image size:         {image_size}")
-    print("Backbone:           pretrained EfficientNet-B0")
-    print("Neck:               wider FPN/PAN with SPPF")
-    print("Fusion:             original 4-scale Gold-YOLO-lite gather-distribute")
-    print("Heads:              stride 4, 8, 16, 32; extra refinement on stride 4 and 8")
+    print(f"Reg max:            {reg_max}")
+    print("Backbone:           pretrained MobileNetV3-Large feature extractor")
+    print("Neck:               width-slimmed 56/72/112 FPN/PAN")
+    print("Fusion:             width 48; N3 refine kept, N4/N5 extra refine removed")
+    print("Heads:              strides 8, 16, 32; hidden minimum 48")
     print("Prediction style:   anchor-free + quality-aware objectness + CIoU-style box loss + DFL")
-    print("Architecture:       deeper quality-aware P2/P3 network with EfficientNet-B0 backbone")
+    print("Architecture:       v0.8 compact MobileNetV3-Large distilled student")
+    print("Box output:         4 x 17 = 68 DFL channels per scale")
     print("Auxiliary branch:   training-only aux heads")
     print(f"Aux loss weight:    {aux_loss_weight}")
+    print("Distillation:       v0.6 frozen EfficientNet-B0 teacher")
+    print(f"Teacher checkpoint: {teacher_checkpoint_path}")
+    print("KD schedule:        epochs 1-2 off, 3-17 full, 18-20 half")
+    print("KD weights:         feature 0.20, class 0.40, objectness 0.20, DFL 0.30")
+    print("KD temperature:     2.0")
     print(f"Classes:            {VOC_CLASSES}")
     print(f"Num classes:        {num_classes}")
     print(f"Train images:       {len(train_dataset)}")
@@ -771,7 +980,10 @@ def main():
     print(f"LR:                 {learning_rate}")
     print(f"Min LR:             {min_lr}")
     print(f"Weight decay:       {weight_decay}")
-    print(f"Parameters:         {model_parameter_count:,}")
+    print(f"Student train params:   {model_parameter_count:,}")
+    print(f"Student infer params:   {inference_parameter_count:,}")
+    print(f"KD adapter params:      {distiller_parameter_count:,}")
+    print(f"Teacher infer params:   {teacher_parameter_count:,}")
     print(f"History:            {history_path}")
     print(f"Checkpoint folder:  {checkpoint_dir}")
     print(f"Experiment name:    {EXPERIMENT_NAME}")
@@ -791,7 +1003,7 @@ def main():
     resume_checkpoint_path = latest_path
 
     print("Resume-safe current training run for the VOC2007 + VOC2012 custom split.")
-    print(r"This uses one stable checkpoint folder: runs\checkpoints_voc8_current")
+    print(r"This uses one stable checkpoint folder: runs\checkpoints_voc8_v08_768_mobilenetv3_distilled")
     print("A checkpoint resumes only if it belongs to this exact experiment name.")
     print("Different/older experiment checkpoints are ignored and removed from the stable folder.")
     print("Current split:")
@@ -836,6 +1048,7 @@ def main():
                 checkpoint_path=resume_checkpoint_path,
                 model=model,
                 ema=ema,
+                distiller=distiller,
                 optimizer=optimizer,
                 scaler=scaler,
                 device=device,
@@ -889,6 +1102,8 @@ def main():
 
             train_metrics = train_one_epoch(
                 model=model,
+                teacher=teacher,
+                distiller=distiller,
                 ema=ema,
                 criterion=criterion,
                 loader=train_loader,
@@ -922,6 +1137,7 @@ def main():
                 checkpoint_path=latest_path,
                 model=model,
                 ema=ema,
+                distiller=distiller,
                 optimizer=optimizer,
                 scaler=scaler,
                 epoch=epoch,
@@ -940,6 +1156,7 @@ def main():
                     checkpoint_path=best_path,
                     model=model,
                     ema=ema,
+                    distiller=distiller,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch,
@@ -969,6 +1186,8 @@ def main():
                 f"train total loss {train_metrics['loss']:.4f} | "
                 f"main {train_metrics['main_loss']:.4f} | "
                 f"aux {train_metrics['aux_loss']:.4f} | "
+                f"kd {train_metrics['distillation_loss']:.4f} "
+                f"x {train_metrics['distillation_scale']:.2f} | "
                 f"val loss {val_metrics['loss']:.4f} | "
                 f"best val loss {best_val_loss:.4f}"
             )
@@ -990,6 +1209,7 @@ def main():
             checkpoint_path=interrupt_path,
             model=model,
             ema=ema,
+            distiller=distiller,
             optimizer=optimizer,
             scaler=scaler,
             epoch=completed_epoch,

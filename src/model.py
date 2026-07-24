@@ -5,10 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+    from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
 except ImportError as error:
     raise ImportError(
-        "torchvision is required for the pretrained EfficientNet-B0 backbone. "
+        "torchvision is required for the pretrained MobileNetV3-Large backbone. "
         "Install it with: pip install torchvision"
     ) from error
 
@@ -190,55 +190,35 @@ class SPPF(nn.Module):
         return self.conv2(torch.cat([x, y1, y2, y3], dim=1))
 
 
-class PretrainedEfficientNetB0Backbone(nn.Module):
+class PretrainedMobileNetV3LargeBackbone(nn.Module):
     """
-    EfficientNet-B0 pretrained backbone.
+    Pretrained MobileNetV3-Large feature backbone for the v0.8 student.
 
-    For any input size divisible by 32, this returns:
+    For an input size divisible by 32, it returns:
 
-        P2: stride 4,  shape [B, 24,   H/4,  W/4]
-        P3: stride 8,  shape [B, 40,   H/8,  W/8]
-        P4: stride 16, shape [B, 112,  H/16, W/16]
-        P5: stride 32, shape [B, 1280, H/32, W/32]
+        P2: stride 4,  shape [B, 24,  H/4,  W/4]
+        P3: stride 8,  shape [B, 40,  H/8,  W/8]
+        P4: stride 16, shape [B, 112, H/16, W/16]
+        P5: stride 32, shape [B, 960, H/32, W/32]
 
-    EfficientNet-B0 feature stages used here:
-        features[0..2] -> P2, stride 4,  24 channels
-        features[3]    -> P3, stride 8,  40 channels
-        features[4..5] -> P4, stride 16, 112 channels
-        features[6..8] -> P5, stride 32, 1280 channels
+    Torchvision MobileNetV3-Large feature groups:
+        features[0..3]  -> P2
+        features[4..6]  -> P3
+        features[7..12] -> P4
+        features[13..16] -> P5
     """
 
     def __init__(self, pretrained: bool = True):
         super().__init__()
 
-        if pretrained:
-            weights = EfficientNet_B0_Weights.DEFAULT
-        else:
-            weights = None
-
-        backbone = efficientnet_b0(weights=weights)
+        weights = MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+        backbone = mobilenet_v3_large(weights=weights)
         features = backbone.features
 
-        self.stage_p2 = nn.Sequential(
-            features[0],
-            features[1],
-            features[2],
-        )
-
-        self.stage_p3 = nn.Sequential(
-            features[3],
-        )
-
-        self.stage_p4 = nn.Sequential(
-            features[4],
-            features[5],
-        )
-
-        self.stage_p5 = nn.Sequential(
-            features[6],
-            features[7],
-            features[8],
-        )
+        self.stage_p2 = nn.Sequential(*features[0:4])
+        self.stage_p3 = nn.Sequential(*features[4:7])
+        self.stage_p4 = nn.Sequential(*features[7:13])
+        self.stage_p5 = nn.Sequential(*features[13:17])
 
         mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
         std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
@@ -262,183 +242,93 @@ class PretrainedEfficientNetB0Backbone(nn.Module):
 
 class TinyNeck(nn.Module):
     """
-    Wider FPN + PAN neck with stride-4 output.
+    Width-slimmed three-scale FPN and PAN neck for v0.8.
+
+    P2/stride-4 remains excluded from the neck and detection heads.
+    Depth is retained while widths are reduced to 56, 72 and 112.
 
     Outputs:
-        N2 base: [B, 64, 160, 160]
-        N3 base: [B, 96, 80, 80]
-        N4 base: [B, 128, 40, 40]
-        N5 base: [B, 192, 20, 20]
+        N3: [B, 56,  H/8,  W/8]
+        N4: [B, 72,  H/16, W/16]
+        N5: [B, 112, H/32, W/32]
     """
 
     def __init__(self):
         super().__init__()
 
-        self.p5_reduce = ConvBNAct(
-            1280,
-            192,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
-
-        self.sppf = SPPF(
-            in_channels=192,
-            out_channels=192,
-            pool_size=5,
-        )
+        self.p5_reduce = ConvBNAct(960, 112, kernel_size=1, stride=1, padding=0)
+        self.sppf = SPPF(in_channels=112, out_channels=112, pool_size=5)
 
         self.fpn4 = C2fLite(
-            in_channels=192 + 112,
-            out_channels=128,
-            num_blocks=3,
+            in_channels=112 + 112,
+            out_channels=72,
+            num_blocks=2,
         )
 
-        self.p4_reduce = ConvBNAct(
-            128,
-            96,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
+        self.p4_reduce = ConvBNAct(72, 56, kernel_size=1, stride=1, padding=0)
 
         self.fpn3 = C2fLite(
-            in_channels=96 + 40,
-            out_channels=96,
+            in_channels=56 + 40,
+            out_channels=56,
             num_blocks=3,
         )
 
-        self.p3_reduce = ConvBNAct(
-            96,
-            64,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
-
-        self.fpn2 = C2fLite(
-            in_channels=64 + 24,
-            out_channels=64,
-            num_blocks=3,
-        )
-
-        self.pan2_down = ConvBNAct(
-            64,
-            96,
-            kernel_size=3,
-            stride=2,
-        )
-
-        self.pan3 = C2fLite(
-            in_channels=96 + 96,
-            out_channels=96,
-            num_blocks=3,
-        )
-
-        self.pan3_down = ConvBNAct(
-            96,
-            128,
-            kernel_size=3,
-            stride=2,
-        )
+        self.pan3_down = ConvBNAct(56, 72, kernel_size=3, stride=2)
 
         self.pan4 = C2fLite(
-            in_channels=128 + 128,
-            out_channels=128,
-            num_blocks=3,
+            in_channels=72 + 72,
+            out_channels=72,
+            num_blocks=2,
         )
 
-        self.pan4_down = ConvBNAct(
-            128,
-            192,
-            kernel_size=3,
-            stride=2,
-        )
+        self.pan4_down = ConvBNAct(72, 112, kernel_size=3, stride=2)
 
         self.pan5 = C2fLite(
-            in_channels=192 + 192,
-            out_channels=192,
-            num_blocks=3,
+            in_channels=112 + 112,
+            out_channels=112,
+            num_blocks=2,
         )
 
     def forward(
         self,
-        p2: torch.Tensor,
         p3: torch.Tensor,
         p4: torch.Tensor,
         p5: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         p5_small = self.p5_reduce(p5)
         p5_context = self.sppf(p5_small)
 
-        p5_up = F.interpolate(
-            p5_context,
-            scale_factor=2,
-            mode="nearest",
-        )
-
+        p5_up = F.interpolate(p5_context, scale_factor=2, mode="nearest")
         fpn4 = self.fpn4(torch.cat([p4, p5_up], dim=1))
 
         fpn4_small = self.p4_reduce(fpn4)
-
-        p4_up = F.interpolate(
-            fpn4_small,
-            scale_factor=2,
-            mode="nearest",
-        )
-
+        p4_up = F.interpolate(fpn4_small, scale_factor=2, mode="nearest")
         fpn3 = self.fpn3(torch.cat([p3, p4_up], dim=1))
 
-        fpn3_small = self.p3_reduce(fpn3)
-
-        p3_up = F.interpolate(
-            fpn3_small,
-            scale_factor=2,
-            mode="nearest",
-        )
-
-        fpn2 = self.fpn2(torch.cat([p2, p3_up], dim=1))
-
-        p2_down = self.pan2_down(fpn2)
-
-        pan3 = self.pan3(torch.cat([fpn3, p2_down], dim=1))
-
-        p3_down = self.pan3_down(pan3)
-
+        p3_down = self.pan3_down(fpn3)
         pan4 = self.pan4(torch.cat([fpn4, p3_down], dim=1))
 
         p4_down = self.pan4_down(pan4)
-
         pan5 = self.pan5(torch.cat([p5_context, p4_down], dim=1))
 
-        return fpn2, pan3, pan4, pan5
+        return fpn3, pan4, pan5
 
 
 class GoldYOLOLiteFusion(nn.Module):
     """
-    Four-scale lightweight gather-distribute fusion.
+    Three-scale lightweight gather-distribute fusion for strides 8, 16 and 32.
 
-    It gathers N2/N3/N4/N5 into one shared 80x80 feature,
-    fuses the information, then redistributes it back to all scales.
+    N3/N4/N5 are gathered to stride 8, fused, then redistributed to each scale.
     """
 
     def __init__(
         self,
-        n2_channels: int = 64,
-        n3_channels: int = 96,
-        n4_channels: int = 128,
-        n5_channels: int = 192,
-        fusion_channels: int = 96,
+        n3_channels: int = 56,
+        n4_channels: int = 72,
+        n5_channels: int = 112,
+        fusion_channels: int = 48,
     ):
         super().__init__()
-
-        self.n2_to_fusion = ConvBNAct(
-            n2_channels,
-            fusion_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-        )
 
         self.n3_to_fusion = ConvBNAct(
             n3_channels,
@@ -466,7 +356,7 @@ class GoldYOLOLiteFusion(nn.Module):
 
         self.fuse = nn.Sequential(
             ConvBNAct(
-                fusion_channels * 4,
+                fusion_channels * 3,
                 fusion_channels,
                 kernel_size=3,
                 stride=1,
@@ -476,14 +366,6 @@ class GoldYOLOLiteFusion(nn.Module):
                 fusion_channels,
                 num_blocks=2,
             ),
-        )
-
-        self.distribute_to_n2 = ConvBNAct(
-            fusion_channels,
-            n2_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
         )
 
         self.distribute_to_n3 = ConvBNAct(
@@ -510,13 +392,6 @@ class GoldYOLOLiteFusion(nn.Module):
             padding=0,
         )
 
-        self.refine_n2 = ConvBNAct(
-            n2_channels,
-            n2_channels,
-            kernel_size=3,
-            stride=1,
-        )
-
         self.refine_n3 = ConvBNAct(
             n3_channels,
             n3_channels,
@@ -524,34 +399,19 @@ class GoldYOLOLiteFusion(nn.Module):
             stride=1,
         )
 
-        self.refine_n4 = ConvBNAct(
-            n4_channels,
-            n4_channels,
-            kernel_size=3,
-            stride=1,
-        )
-
-        self.refine_n5 = ConvBNAct(
-            n5_channels,
-            n5_channels,
-            kernel_size=3,
-            stride=1,
-        )
+        # Retained from v0.6: keep the high-resolution N3 refinement but
+        # remove the extra low-resolution 3x3 refinement convolutions. The gathered
+        # fusion signal is still projected and added to N4 and N5.
+        self.refine_n4 = nn.Identity()
+        self.refine_n5 = nn.Identity()
 
     def forward(
         self,
-        n2: torch.Tensor,
         n3: torch.Tensor,
         n4: torch.Tensor,
         n5: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         target_size = n3.shape[-2:]
-
-        n2_gather = F.interpolate(
-            self.n2_to_fusion(n2),
-            size=target_size,
-            mode="nearest",
-        )
 
         n3_gather = self.n3_to_fusion(n3)
 
@@ -568,19 +428,11 @@ class GoldYOLOLiteFusion(nn.Module):
         )
 
         gathered = torch.cat(
-            [n2_gather, n3_gather, n4_gather, n5_gather],
+            [n3_gather, n4_gather, n5_gather],
             dim=1,
         )
 
         fused = self.fuse(gathered)
-
-        fused_to_n2 = F.interpolate(
-            fused,
-            size=n2.shape[-2:],
-            mode="nearest",
-        )
-
-        fused_to_n3 = fused
 
         fused_to_n4 = F.interpolate(
             fused,
@@ -594,23 +446,22 @@ class GoldYOLOLiteFusion(nn.Module):
             mode="nearest",
         )
 
-        n2 = self.refine_n2(n2 + self.distribute_to_n2(fused_to_n2))
-        n3 = self.refine_n3(n3 + self.distribute_to_n3(fused_to_n3))
+        n3 = self.refine_n3(n3 + self.distribute_to_n3(fused))
         n4 = self.refine_n4(n4 + self.distribute_to_n4(fused_to_n4))
         n5 = self.refine_n5(n5 + self.distribute_to_n5(fused_to_n5))
 
-        return n2, n3, n4, n5
+        return n3, n4, n5
 
 
 class DetectionHead(nn.Module):
     """
     Stronger decoupled head.
 
-    For stride-4 and stride-8 features, extra_refine_blocks can add
+    For high-resolution features, extra_refine_blocks can add
     lightweight C2fLite refinement before the box/objectness/class branches.
 
     It predicts:
-        box_logits: 4 * 17 = 68 DFL channels
+        box_logits: 4 * (reg_max + 1) DFL channels
         obj_logits: 1 objectness channel
         cls_logits: 8 class channels
     """
@@ -628,8 +479,8 @@ class DetectionHead(nn.Module):
         self.reg_max = reg_max
         self.num_bins = reg_max + 1
 
-        box_hidden = max(64, in_channels)
-        cls_hidden = max(64, in_channels)
+        box_hidden = max(48, in_channels)
+        cls_hidden = max(48, in_channels)
 
         if extra_refine_blocks > 0:
             self.extra_refine = C2fLite(
@@ -728,10 +579,23 @@ class DetectionHead(nn.Module):
 
 
 class TinyYOLOAnchorFree(nn.Module):
+    """
+    v0.8 compact distilled student detector.
+
+    Architecture:
+        - pretrained MobileNetV3-Large feature backbone
+        - 768 x 768 input and reg_max=16
+        - neck widths 56, 72 and 112
+        - Gold-YOLO-lite fusion width 48
+        - detection-head hidden minimum reduced from 64 to 48
+        - three anchor-free heads at strides 8, 16 and 32
+        - training-only auxiliary heads
+    """
+
     def __init__(
         self,
         num_classes: int = 8,
-        image_size: int = 960,
+        image_size: int = 768,
         reg_max: int = 16,
         pretrained_backbone: bool = True,
         use_auxiliary_heads: bool = True,
@@ -742,91 +606,79 @@ class TinyYOLOAnchorFree(nn.Module):
         self.image_size = image_size
         self.reg_max = reg_max
         self.num_bins = reg_max + 1
-        self.strides = [4, 8, 16, 32]
+        self.strides = [8, 16, 32]
         self.use_auxiliary_heads = use_auxiliary_heads
 
-        self.backbone = PretrainedEfficientNetB0Backbone(
+        self.backbone = PretrainedMobileNetV3LargeBackbone(
             pretrained=pretrained_backbone,
         )
 
         self.neck = TinyNeck()
 
         self.gold_fusion = GoldYOLOLiteFusion(
-            n2_channels=64,
-            n3_channels=96,
-            n4_channels=128,
-            n5_channels=192,
-            fusion_channels=96,
-        )
-
-        self.head_p2 = DetectionHead(
-            in_channels=64,
-            num_classes=num_classes,
-            reg_max=reg_max,
-            extra_refine_blocks=4,
+            n3_channels=56,
+            n4_channels=72,
+            n5_channels=112,
+            fusion_channels=48,
         )
 
         self.head_p3 = DetectionHead(
-            in_channels=96,
+            in_channels=56,
             num_classes=num_classes,
             reg_max=reg_max,
             extra_refine_blocks=3,
         )
 
         self.head_p4 = DetectionHead(
-            in_channels=128,
+            in_channels=72,
             num_classes=num_classes,
             reg_max=reg_max,
             extra_refine_blocks=2,
         )
 
         self.head_p5 = DetectionHead(
-            in_channels=192,
+            in_channels=112,
             num_classes=num_classes,
             reg_max=reg_max,
             extra_refine_blocks=2,
         )
 
-        self.aux_head_p2 = DetectionHead(
-            in_channels=64,
-            num_classes=num_classes,
-            reg_max=reg_max,
-            extra_refine_blocks=3,
-        )
+        if use_auxiliary_heads:
+            self.aux_head_p3 = DetectionHead(
+                in_channels=56,
+                num_classes=num_classes,
+                reg_max=reg_max,
+                extra_refine_blocks=2,
+            )
 
-        self.aux_head_p3 = DetectionHead(
-            in_channels=96,
-            num_classes=num_classes,
-            reg_max=reg_max,
-            extra_refine_blocks=2,
-        )
+            self.aux_head_p4 = DetectionHead(
+                in_channels=72,
+                num_classes=num_classes,
+                reg_max=reg_max,
+                extra_refine_blocks=0,
+            )
 
-        self.aux_head_p4 = DetectionHead(
-            in_channels=128,
-            num_classes=num_classes,
-            reg_max=reg_max,
-            extra_refine_blocks=0,
-        )
-
-        self.aux_head_p5 = DetectionHead(
-            in_channels=192,
-            num_classes=num_classes,
-            reg_max=reg_max,
-            extra_refine_blocks=0,
-        )
+            self.aux_head_p5 = DetectionHead(
+                in_channels=112,
+                num_classes=num_classes,
+                reg_max=reg_max,
+                extra_refine_blocks=0,
+            )
+        else:
+            self.aux_head_p3 = None
+            self.aux_head_p4 = None
+            self.aux_head_p5 = None
 
         projection = torch.arange(self.num_bins, dtype=torch.float32)
         self.register_buffer("dfl_projection", projection, persistent=False)
 
     def make_main_outputs(
         self,
-        n2: torch.Tensor,
         n3: torch.Tensor,
         n4: torch.Tensor,
         n5: torch.Tensor,
     ) -> List[Dict[str, torch.Tensor]]:
         return [
-            {**self.head_p2(n2), "stride": 4},
             {**self.head_p3(n3), "stride": 8},
             {**self.head_p4(n4), "stride": 16},
             {**self.head_p5(n5), "stride": 32},
@@ -834,13 +686,20 @@ class TinyYOLOAnchorFree(nn.Module):
 
     def make_aux_outputs(
         self,
-        n2: torch.Tensor,
         n3: torch.Tensor,
         n4: torch.Tensor,
         n5: torch.Tensor,
     ) -> List[Dict[str, torch.Tensor]]:
+        if not self.use_auxiliary_heads:
+            raise RuntimeError(
+                "Auxiliary outputs were requested from an inference-only model."
+            )
+
+        assert self.aux_head_p3 is not None
+        assert self.aux_head_p4 is not None
+        assert self.aux_head_p5 is not None
+
         return [
-            {**self.aux_head_p2(n2), "stride": 4},
             {**self.aux_head_p3(n3), "stride": 8},
             {**self.aux_head_p4(n4), "stride": 16},
             {**self.aux_head_p5(n5), "stride": 32},
@@ -851,25 +710,23 @@ class TinyYOLOAnchorFree(nn.Module):
         x: torch.Tensor,
         decode: bool = False,
         return_aux: bool = False,
+        return_features: bool = False,
     ):
-        p2, p3, p4, p5 = self.backbone(x)
+        _p2, p3, p4, p5 = self.backbone(x)
 
-        n2_base, n3_base, n4_base, n5_base = self.neck(
-            p2,
+        n3_base, n4_base, n5_base = self.neck(
             p3,
             p4,
             p5,
         )
 
-        n2, n3, n4, n5 = self.gold_fusion(
-            n2_base,
+        n3, n4, n5 = self.gold_fusion(
             n3_base,
             n4_base,
             n5_base,
         )
 
         main_outputs = self.make_main_outputs(
-            n2,
             n3,
             n4,
             n5,
@@ -878,18 +735,29 @@ class TinyYOLOAnchorFree(nn.Module):
         if decode:
             return self.decode_outputs(main_outputs)
 
-        if return_aux and self.use_auxiliary_heads:
-            aux_outputs = self.make_aux_outputs(
-                n2_base,
-                n3_base,
-                n4_base,
-                n5_base,
-            )
+        if return_aux or return_features:
+            result = {"main": main_outputs}
 
-            return {
-                "main": main_outputs,
-                "aux": aux_outputs,
-            }
+            if return_aux:
+                if not self.use_auxiliary_heads:
+                    raise RuntimeError(
+                        "return_aux=True requires use_auxiliary_heads=True."
+                    )
+
+                result["aux"] = self.make_aux_outputs(
+                    n3_base,
+                    n4_base,
+                    n5_base,
+                )
+
+            if return_features:
+                result["features"] = {
+                    "n3": n3,
+                    "n4": n4,
+                    "n5": n5,
+                }
+
+            return result
 
         return main_outputs
 
@@ -993,12 +861,9 @@ class TinyYOLOAnchorFree(nn.Module):
             all_boxes.append(boxes)
             all_scores.append(scores)
 
-        all_boxes = torch.cat(all_boxes, dim=1)
-        all_scores = torch.cat(all_scores, dim=1)
-
         return {
-            "boxes": all_boxes,
-            "scores": all_scores,
+            "boxes": torch.cat(all_boxes, dim=1),
+            "scores": torch.cat(all_scores, dim=1),
         }
 
 
@@ -1008,3 +873,35 @@ def count_parameters(model: nn.Module) -> int:
         for p in model.parameters()
         if p.requires_grad
     )
+
+
+def count_inference_parameters(model: nn.Module) -> int:
+    """Counts parameters used by inference, excluding auxiliary heads."""
+
+    return sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and not name.startswith("aux_head_")
+    )
+
+
+def load_inference_state_dict(
+    model: nn.Module,
+    state_dict: Dict[str, torch.Tensor],
+) -> None:
+    """Loads a full training state dict or an inference-only state dict."""
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(incompatible.missing_keys)
+    unexpected_keys = [
+        key
+        for key in incompatible.unexpected_keys
+        if not key.startswith("aux_head_")
+    ]
+
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            "Inference checkpoint does not match the current architecture.\n"
+            f"Missing keys: {missing_keys}\n"
+            f"Unexpected non-auxiliary keys: {unexpected_keys}"
+        )
