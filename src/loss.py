@@ -9,7 +9,7 @@ class YOLOAnchorFreeLoss(nn.Module):
     def __init__(
         self,
         num_classes: int = 8,
-        image_size: int = 640,
+        image_size: int = 768,
         reg_max: int = 16,
         box_loss_weight: float = 5.0,
         cls_loss_weight: float = 1.0,
@@ -534,7 +534,6 @@ class YOLOAnchorFreeLoss(nn.Module):
         zero = torch.tensor(0.0, dtype=torch.float32, device=device)
 
         diagnostics = {
-            "num_positive_stride_4": zero.clone(),
             "num_positive_stride_8": zero.clone(),
             "num_positive_stride_16": zero.clone(),
             "num_positive_stride_32": zero.clone(),
@@ -546,7 +545,6 @@ class YOLOAnchorFreeLoss(nn.Module):
         if positive_strides.numel() == 0:
             return diagnostics
 
-        diagnostics["num_positive_stride_4"] = (positive_strides == 4).sum().float()
         diagnostics["num_positive_stride_8"] = (positive_strides == 8).sum().float()
         diagnostics["num_positive_stride_16"] = (positive_strides == 16).sum().float()
         diagnostics["num_positive_stride_32"] = (positive_strides == 32).sum().float()
@@ -683,7 +681,6 @@ class YOLOAnchorFreeLoss(nn.Module):
             "box_loss": box_loss.detach(),
             "dfl_loss": dfl_loss.detach(),
             "num_positive_points": foreground_mask.sum().detach(),
-            "num_positive_stride_4": positive_diagnostics["num_positive_stride_4"].detach(),
             "num_positive_stride_8": positive_diagnostics["num_positive_stride_8"].detach(),
             "num_positive_stride_16": positive_diagnostics["num_positive_stride_16"].detach(),
             "num_positive_stride_32": positive_diagnostics["num_positive_stride_32"].detach(),
