@@ -44,3 +44,10 @@ tmp/
 # External baseline folders and local logs
 external_models/
 log.txt
+
+# Local architecture snapshots and one-off migration helpers
+src_v05/
+src/model_v0_1_backup.py
+src/*_v03.bat
+edit_small_model.py
+src/benchmark_v03_b1.bat
